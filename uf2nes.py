@@ -1,449 +1,341 @@
 #!/usr/bin/env python3
 """
-UF2 to NES ROM Converter
-Converts Raspberry Pi RP2040 UF2 firmware files into bootable .nes ROMs.
-Extracts sprite/graphics data from the UF2 binary and packages it with
-real 6502 code into a valid iNES format ROM that runs on emulators and
-real NES hardware.
+UF2 → NES 1-to-1 Converter
+
+Takes a Raspberry Pi RP2040 UF2 firmware file and produces a valid, bootable
+.nes ROM. The raw UF2 binary payload is preserved byte-for-byte inside the
+PRG ROM. A tiny 6502 bootstrap initializes the NES and displays the extracted
+graphics on screen.
 
 Usage:
     python uf2nes.py firmware.uf2 output.nes
     python uf2nes.py firmware.uf2 output.nes --scan
 """
 
-import struct
-import sys
-import os
+import struct, sys, os
 
-# ── UF2 Format ─────────────────────────────────────────────────────
-UF2_MAGIC_START = 0x0A324655  # "UF2\n"
+# ── UF2 Format ────────────────────────────────────────────────────
+UF2_MAGIC_START  = 0x0A324655
 UF2_MAGIC_START2 = 0x9E5D5157
-UF2_MAGIC_END = 0x0AB16F30
+UF2_MAGIC_END    = 0x0AB16F30
 BLOCK_SIZE = 512
-DATA_SIZE = 256
+DATA_SIZE  = 256
 
 def parse_uf2(path):
-    """Parse UF2 file, return list of (address, data) blocks sorted by address."""
-    total_size = os.path.getsize(path)
-    if total_size % BLOCK_SIZE != 0:
-        print(f"Warning: file size {total_size} not multiple of {BLOCK_SIZE}")
+    """Extract raw binary payload from UF2 file (concatenated data blocks)."""
+    size = os.path.getsize(path)
+    if size % BLOCK_SIZE != 0:
+        print(f"Warning: file size {size} not multiple of {BLOCK_SIZE}")
 
     blocks = []
     with open(path, 'rb') as f:
-        block_num = 0
+        num = 0
         while True:
             raw = f.read(BLOCK_SIZE)
             if len(raw) < BLOCK_SIZE:
                 break
-
-            magic1, magic2 = struct.unpack_from('<II', raw, 0)
-            if magic1 != UF2_MAGIC_START or magic2 != UF2_MAGIC_START2:
-                print(f"Warning: bad magic at block {block_num}, skipping")
-                block_num += 1
-                continue
-
-            flags = struct.unpack_from('<I', raw, 8)[0]
+            m1, m2 = struct.unpack_from('<II', raw, 0)
+            if m1 != UF2_MAGIC_START or m2 != UF2_MAGIC_START2:
+                num += 1; continue
             addr = struct.unpack_from('<I', raw, 12)[0]
-            payload_size = struct.unpack_from('<I', raw, 16)[0]
-            bnum = struct.unpack_from('<I', raw, 20)[0]
-            tblocks = struct.unpack_from('<I', raw, 24)[0]
-            data = raw[32:32 + payload_size]
-            magic_end = struct.unpack_from('<I', raw, 32 + DATA_SIZE)[0]
-
-            if magic_end != UF2_MAGIC_END:
-                print(f"Warning: bad end magic at block {block_num}")
-
+            plen = struct.unpack_from('<I', raw, 16)[0]
+            data = raw[32:32 + plen]
+            me = struct.unpack_from('<I', raw, 32 + DATA_SIZE)[0]
             blocks.append((addr, data))
-            block_num += 1
+            num += 1
 
     if not blocks:
-        print("Error: no valid UF2 blocks found")
-        sys.exit(1)
+        print("Error: no valid UF2 blocks found"); sys.exit(1)
 
-    # Sort by address and concatenate
     blocks.sort(key=lambda x: x[0])
     binary = b''
-    last_addr = None
+    last = None
     for addr, data in blocks:
-        if last_addr is not None and addr != last_addr:
-            gap = addr - last_addr
-            if gap > 0:
-                binary += b'\x00' * gap
-            elif gap < 0:
-                continue  # overlapping, skip
+        if last is not None and addr > last:
+            binary += b'\x00' * (addr - last)
         binary += data
-        last_addr = addr + len(data)
+        last = addr + len(data)
 
-    print(f"UF2: {len(blocks)} blocks, {len(binary)} bytes extracted")
+    print(f"UF2: {num} blocks, raw payload {len(binary)} bytes")
     return binary
 
 
-# ── Asset Extraction ───────────────────────────────────────────────
-def find_palettes(data):
-    """Try to find NES-like palette data in the binary."""
-    # Look for MakeCode Arcade palette patterns (16 color indices)
-    palettes = []
-    # Scan for plausible palette data: 16 consecutive bytes with values 0x00-0x3F
+# ── Asset scan ─────────────────────────────────────────────────────
+def scan_assets(data):
+    """Scan binary for palette and tile candidates."""
+    # Find palette candidates: 16 consecutive bytes 0x00-0x3F
+    pals = []
     i = 0
     while i < len(data) - 16:
-        chunk = data[i:i + 16]
-        if all(0x00 <= b <= 0x3F for b in chunk):
-            # Check if this is distinct (not all zeros, not all same)
-            if len(set(chunk)) > 2 and sum(chunk) > 0:
-                palettes.append((i, list(chunk)))
-                i += 16
-                continue
-        i += 1
-    return palettes
-
-
-def find_sprites(data):
-    """Try to extract potential 8x8 sprite data from the binary."""
-    # Look for 16-byte patterns that look like CHR data (2-bit pixel data)
-    # In CHR format, each 8x8 tile is 16 bytes (8 bytes low, 8 bytes high)
-    candidates = []
-    # Also look for MakeCode Arcade image headers
-    # MakeCode stores images as: width, height, pixel_data[]
-    # Each pixel is 2 bytes (16-bit color)
-    i = 0
-    while i < len(data) - 64:
-        # Check for patterns that look like structured pixel data
-        # Try to find 16x16 image regions
-        chunk = data[i:i + 64]
-        # Check if this looks like it has structure (not too random)
-        unique = len(set(chunk))
-        if 8 < unique < 48:
-            candidates.append((i, list(chunk)))
-            i += 64
-            continue
+        chunk = data[i:i+16]
+        if all(0x00 <= b <= 0x3F for b in chunk) and len(set(chunk)) > 2:
+            pals.append((i, list(chunk)))
+            i += 16; continue
         i += 1
 
-    # Limit candidates
-    return candidates[:128]
-
-
-def extract_tiles_from_raw(data):
-    """Try to extract meaningful tile data from raw binary."""
+    # Find CHR-like tiles: 16-byte windows with balanced bit density
     tiles = []
-    # Scan 16-byte windows for CHR-like data
     for i in range(0, min(len(data), 65536) - 16, 16):
-        chunk = data[i:i + 16]
-        # CHR data: first 8 bytes low plane, last 8 bytes high plane
-        # Each bit represents a pixel
-        # Check if this has typical CHR characteristics
-        low = chunk[:8]
-        high = chunk[8:16]
-        # Valid CHR should have some structure
-        # Check that bits in low/high aren't too random
-        low_density = sum(bin(b).count('1') for b in low) / 64
-        high_density = sum(bin(b).count('1') for b in high) / 64
-        if 0.1 < low_density < 0.9 and 0.1 < high_density < 0.9:
-            tiles.append(list(chunk))
-            if len(tiles) >= 512:
-                break
+        c = data[i:i+16]
+        ld = sum(bin(b).count('1') for b in c[:8]) / 64
+        hd = sum(bin(b).count('1') for b in c[8:16]) / 64
+        if 0.1 < ld < 0.9 and 0.1 < hd < 0.9:
+            tiles.append(list(c))
+            if len(tiles) >= 512: break
 
-    return tiles
+    return pals, tiles
 
 
-# ── iNES ROM Builder ──────────────────────────────────────────────
-def make_ines_header(prg_size=1, chr_size=1, mapper=0, mirroring=0):
-    """Build a 16-byte iNES header."""
-    h = bytearray(16)
-    h[0:4] = b'NES\x1a'
-    h[4] = prg_size & 0xFF      # PRG in 16KB units
-    h[5] = chr_size & 0xFF      # CHR in 8KB units
-    flags6 = 0
-    if mirroring:
-        flags6 |= 1  # Vertical mirroring
-    h[6] = flags6
-    h[7] = (mapper & 0x0F) << 4
-    return bytes(h)
-
-
-def make_6502_code(palette_data, has_chr):
-    """Generate 6502 assembly code for the NES ROM.
-    Returns assembled PRG ROM bytes (32768 bytes for NROM-256).
+# ── NES ROM Builder ────────────────────────────────────────────────
+def build_rom(uf2_data, pals, tiles):
+    """Build a complete .nes file: header + PRG + CHR.
+    The raw UF2 payload is embedded 1:1 in PRG ROM after the bootstrap.
     """
-    prg = bytearray(32768)
+    # ── Bootstrap 6502 code (placed at $8000) ──
+    # We use a stack of bytearrays to avoid forward-reference fixups.
+    # Build the wait-vblank subroutine first, compute its CPU address,
+    # then emit the JSRs with the correct address from the start.
 
-    # 6502 code at $8000
-    code = []
+    # wait-vblank subroutine (BIT $2002 ; BPL -3 ; RTS)
+    sub_wait = [0x2C, 0x02, 0x20, 0x10, 0xFB, 0x60]
 
-    # Standard NES init
-    code += [0x78]                         # SEI
-    code += [0xD8]                         # CLD
-    code += [0xA2, 0xFF]                   # LDX #$FF
-    code += [0x9A]                         # TXS
-    code += [0xA2, 0x00]                   # LDX #$00
+    bootstrap = []
+    def emit(*args):
+        for a in args:
+            if isinstance(a, int):
+                bootstrap.append(a)
+            else:
+                bootstrap.extend(a)
 
-    # Clear PPU registers first
-    code += [0x8E, 0x00, 0x20]            # STX $2000
-    code += [0x8E, 0x01, 0x20]            # STX $2001
+    emit(
+        0x78,                         # SEI
+        0xD8,                         # CLD
+        0xA2, 0xFF, 0x9A,             # LDX #$FF ; TXS
+        0xA2, 0x00,                   # LDX #$00
+        0x8E, 0x00, 0x20,             # STX $2000
+        0x8E, 0x01, 0x20,             # STX $2001
+    )
 
-    # Wait for PPU warmup (2 vblanks)
-    code += [0x20, 0x1C, 0x80]            # JSR $801C (wait_vblank)
-    code += [0x20, 0x1C, 0x80]            # JSR $801C
+    # Wait 2 vblanks — we know sub_wait will be placed right after enable-code
+    # For now emit placeholder addresses, will patch later
+    jsr_wait_idx1 = len(bootstrap)
+    emit(0x20, 0x00, 0x00)  # placeholder JSR
+    jsr_wait_idx2 = len(bootstrap)
+    emit(0x20, 0x00, 0x00)  # placeholder JSR
 
-    # Load palette to PPU
-    code += [0xA9, 0x3F]                   # LDA #$3F
-    code += [0x8D, 0x06, 0x20]            # STA $2006
-    code += [0xA9, 0x00]                   # LDA #$00
-    code += [0x8D, 0x06, 0x20]            # STA $2006
-    code += [0xA0, 0x00]                   # LDY #$00
+    # Load palette
+    emit(0xA9, 0x3F, 0x8D, 0x06, 0x20)  # STA $2006 ; high
+    emit(0xA9, 0x00, 0x8D, 0x06, 0x20)  # STA $2006 ; low
 
-    # Copy palette (up to 32 bytes)
-    pal_bytes = palette_data[:32]
-    while len(pal_bytes) < 32:
-        pal_bytes.append(0x0F)  # Default black
-    # Clamp palette values to 0x00-0x3F
-    pal_bytes = [b & 0x3F for b in pal_bytes]
+    pal_data = []
+    if pals:
+        pal_data = max(pals, key=lambda p: sum(p[1]))[1]
+    while len(pal_data) < 32:
+        pal_data.append(0x0F)
+    pal_data = [b & 0x3F for b in pal_data[:32]]
+    for pb in pal_data:
+        emit(0xA9, pb, 0x8D, 0x07, 0x20)
 
-    # Self-modifying code to embed palette
-    # Store palette at end of PRG and copy it
-    # Actually, just embed it directly
-    for i, pb in enumerate(pal_bytes):
-        code += [0xA9, pb]                 # LDA #palette_byte
-        code += [0x8D, 0x07, 0x20]        # STA $2007
-        if i == 31:
-            break
+    # Enable rendering
+    emit(
+        0xA9, 0x90, 0x8D, 0x00, 0x20,  # LDA #$90 ; STA $2000
+        0xA9, 0x1E, 0x8D, 0x01, 0x20,  # LDA #$1E ; STA $2001
+        0xA9, 0x00, 0x8D, 0x03, 0x20,  # STA $2003
+        0xA9, 0x02, 0x8D, 0x03, 0x20,  # STA $2003
+    )
 
-    # Set up $2000 - enable NMI, use 8x16 sprites, base nametable 0
-    code += [0xA9, 0x90]                   # LDA #$90
-    code += [0x8D, 0x00, 0x20]            # STA $2000
+    # Now sub_wait goes here — compute its CPU address
+    sub_wait_addr = 0x8000 + len(bootstrap)
+    # Patch the two JSRs
+    bootstrap[jsr_wait_idx1 + 1] = sub_wait_addr & 0xFF
+    bootstrap[jsr_wait_idx1 + 2] = (sub_wait_addr >> 8) & 0xFF
+    bootstrap[jsr_wait_idx2 + 1] = sub_wait_addr & 0xFF
+    bootstrap[jsr_wait_idx2 + 2] = (sub_wait_addr >> 8) & 0xFF
+    emit(sub_wait)
 
-    # Set up $2001 - enable rendering (sprites + background)
-    code += [0xA9, 0x1E]                   # LDA #$1E
-    code += [0x8D, 0x01, 0x20]            # STA $2001
-
-    # Simple sprite OAM data at $0200
-    # Position 16 sprites in a pattern
-    code += [0xA9, 0x00]                   # LDA #$00
-    code += [0x8D, 0x03, 0x20]            # STA $2003 (OAM addr low)
-    code += [0xA9, 0x02]                   # LDA #$02
-    code += [0x8D, 0x03, 0x20]            # STA $2003 (OAM addr high)
-    code += [0xA0, 0x00]                   # LDY #$00
-
-    # Fill OAM with 16 sprites using DMA ($4014)
-    # First set up OAM data in $0200 area
-    oam_addr = 0x0200
-    # Write OAM data: Y, tile, attr, X
-    sprite_data = []
+    # Build OAM data: 16 sprites in a grid
+    oam = []
     for row in range(4):
         for col in range(4):
             sy = 30 + row * 56
             sx = 30 + col * 56
-            tile_idx = row * 4 + col
-            sprite_data += [sy & 0xFF, tile_idx, 0x00, sx & 0xFF]
+            ti = row * 4 + col
+            oam += [sy & 0xFF, ti, 0x00, sx & 0xFF]
 
-    # Code to copy sprite data to OAM area
-    code += [0xA2, 0x00]                   # LDX #$00
-    copy_loop_addr = len(code) + 0x8000
-    for sd in sprite_data:
-        code += [0xA9, sd]                 # LDA #sprite_byte
-        code += [0x9D, 0x00, 0x02]        # STA $0200,X
-        code += [0xE8]                     # INX
-    code += [0xE0, len(sprite_data)]       # CPX #len
-    # Actually just continue, we wrote all bytes
+    # Copy OAM to $0200 via inline LDA/STA (no loop)
+    for b in oam:
+        emit(0xA9, b, 0x9D, 0x00, 0x02, 0xE8)  # LDA #b; STA $0200,X; INX
 
-    # Sprite DMA
-    code += [0xA9, 0x02]                   # LDA #$02
-    code += [0x8D, 0x14, 0x40]            # STA $4014
+    # Fire OAM DMA
+    emit(0xA9, 0x02, 0x8D, 0x14, 0x40)  # LDA #2; STA $4014
 
-    # Main loop
-    main_loop_addr = len(code) + 0x8000
-    # Simple scroll effect
-    code += [0xEE, 0x05, 0x20]            # INC $2005 (scroll X)
-    code += [0xA9, 0x01]                   # LDA #$01
-    code += [0xCD, 0x02, 0x10]            # CMP $1002 (wait for flag)
-    code += [0xD0, 0xFA]                   # BNE *-4
-    code += [0x4C, main_loop_addr & 0xFF, (main_loop_addr >> 8) & 0xFF]  # JMP main_loop
+    # Main loop (infinite)
+    main_loop_ofs = len(bootstrap)
+    emit(0x4C, main_loop_ofs & 0xFF, (main_loop_ofs >> 8) & 0xFF)
 
-    # Wait for vblank subroutine
-    wait_addr = len(code) + 0x8000
-    code += [0xAD, 0x02, 0x20]            # LDA $2002
-    wait_vblank_addr = len(code) + 0x8000
-    code += [0x2C, 0x02, 0x20]            # BIT $2002
-    code += [0x10, 0xFB]                   # BPL *-3
-    code += [0x60]                         # RTS
+    bs_len = len(bootstrap)
 
-    # Place code at start of PRG
-    code_len = len(code)
-    if code_len > 0x7FC0:
-        print(f"Warning: code too large ({code_len} bytes)")
-        code = code[:0x7FC0]
+    # ── Determine PRG size & mapper ──
+    min_banks = (bs_len + len(uf2_data) + 16383) // 16384
 
-    prg[0:code_len] = bytes(code)
+    if min_banks <= 2:
+        mapper = 0
+        mapper_name = "NROM"
+        valid_banks = [1, 2]
+    else:
+        mapper = 1
+        mapper_name = "MMC1"
+        valid_banks = [8, 16, 32]  # MMC1 valid PRG bank counts
 
-    # Write reset vector at $FFFC -> $8000
-    prg[0x7FFC] = 0x00
-    prg[0x7FFD] = 0x80
-
-    # Write NMI vector at $FFFA -> main loop
-    prg[0x7FFA] = main_loop_addr & 0xFF
-    prg[0x7FFB] = (main_loop_addr >> 8) & 0xFF
-
-    # Write IRQ vector at $FFFE -> $8000
-    prg[0x7FFE] = 0x00
-    prg[0x7FFF] = 0x80
-
-    return bytes(prg)
-
-
-def make_chr_rom(tile_data):
-    """Build CHR ROM from tile data. Needs exactly 8192 bytes (512 tiles)."""
-    chr_rom = bytearray(8192)
-
-    if tile_data:
-        # Pack tiles into CHR
-        for i, tile in enumerate(tile_data):
-            if i >= 512:
-                break
-            tile_bytes = list(tile)
-            # If tile is 16 bytes of CHR data, use directly
-            if len(tile_bytes) >= 16:
-                chr_rom[i * 16:(i * 16) + 16] = tile_bytes[:16]
-            else:
-                # Pad short tiles
-                for j in range(16):
-                    if j < len(tile_bytes):
-                        chr_rom[i * 16 + j] = tile_bytes[j]
-                    else:
-                        chr_rom[i * 16 + j] = 0
-
-    # If no tile data, generate demo pattern
-    has_data = any(b != 0 for b in chr_rom)
-    if not has_data:
-        # Generate a simple demo CHR ROM with shapes
-        for tile_idx in range(512):
-            base = tile_idx * 16
-            t = tile_idx
-            for y in range(8):
-                low = 0
-                high = 0
-                for x in range(8):
-                    # Create patterns based on tile index
-                    if (t % 4) == 0:
-                        # Checkerboard
-                        v = 1 if (x + y) % 2 == 0 else 0
-                    elif (t % 4) == 1:
-                        # Box
-                        v = 1 if 1 < x < 6 and 1 < y < 6 else 0
-                    elif (t % 4) == 2:
-                        # Diagonal
-                        v = 1 if x == y or x == 7 - y else 0
-                    else:
-                        # Solid
-                        v = 1 if x < 4 else 0
-
-                    if v & 1:
-                        low |= (1 << (7 - x))
-                    if v & 2:
-                        high |= (1 << (7 - x))
-                chr_rom[base + y] = low
-                chr_rom[base + y + 8] = high
-
-    return bytes(chr_rom)
-
-
-# ── Main ───────────────────────────────────────────────────────────
-def main():
-    if len(sys.argv) < 2:
-        print("UF2 to NES ROM Converter")
-        print("Usage:")
-        print(f"  python {os.path.basename(__file__)} <input.uf2> [output.nes]")
-        print(f"  python {os.path.basename(__file__)} <input.uf2> [output.nes] --scan")
-        print("")
-        print("The script extracts graphics data from RP2040 UF2 firmware")
-        print("and builds a valid, bootable NES ROM that displays the")
-        print("extracted sprites on real hardware or emulators.")
-        sys.exit(0)
-
-    input_path = sys.argv[1]
-    base = os.path.splitext(os.path.basename(input_path))[0]
-    output_path = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith('--') else f"{base}.nes"
-
-    scan_mode = '--scan' in sys.argv
-
-    if not os.path.exists(input_path):
-        print(f"Error: file not found: {input_path}")
+    # Round up to next valid bank count
+    prg_banks = None
+    for v in valid_banks:
+        if v >= min_banks:
+            prg_banks = v
+            break
+    if prg_banks is None:
+        print(f"Error: UF2 data too large ({len(uf2_data)} bytes, needs {min_banks} banks)")
         sys.exit(1)
 
-    print(f"Reading UF2: {input_path}")
-    binary = parse_uf2(input_path)
+    prg_size = prg_banks * 16384
 
-    # Extract assets
-    palettes = find_palettes(binary)
-    if scan_mode:
-        print(f"  Found {len(palettes)} palette candidates")
-        for addr, pal in palettes[:5]:
-            print(f"    @ ${addr:05X}: [{', '.join(f'${b:02X}' for b in pal[:4])}...]")
+    print(f"  Bootstrap: {bs_len} bytes")
+    print(f"  UF2 payload: {len(uf2_data)} bytes (1:1 preserved)")
+    print(f"  PRG banks: {prg_banks} x 16KB = {prg_size} bytes")
 
-    # Try to find tile data
-    tiles = extract_tiles_from_raw(binary)
-    sprite_candidates = find_sprites(binary)
+    prg = bytearray(prg_size)
+    prg[0:bs_len] = bytes(bootstrap)
+    prg[bs_len:bs_len + len(uf2_data)] = uf2_data
 
-    print(f"  Found {len(tiles)} tile candidates, {len(sprite_candidates)} sprite candidates")
+    # Vectors at end of last 16KB page ($FFFA-$FFFF in CPU space)
+    prg[-6] = main_loop_ofs & 0xFF                                     # NMI low
+    prg[-5] = (0x8000 + main_loop_ofs) >> 8 & 0xFF                     # NMI high
+    prg[-4] = 0x00                                                      # Reset low
+    prg[-3] = 0x80                                                      # Reset high ($8000)
+    prg[-2] = 0x00                                                      # IRQ low
+    prg[-1] = 0x80                                                      # IRQ high
 
-    # Use best available data
-    best_tiles = None
+    # ── CHR ROM ──
+    chr_rom = bytearray(8192)
     if tiles:
-        best_tiles = tiles[:512]
-        print("  Using extracted tile data")
-    elif sprite_candidates:
-        # Convert sprite candidates to CHR format
-        best_tiles = []
-        for addr, spr in sprite_candidates[:128]:
-            # Try to interpret as 8x8 tile data
-            if len(spr) >= 16 and len(set(spr[:16])) > 4:
-                best_tiles.append(spr[:16])
-        if best_tiles:
-            print(f"  Using {len(best_tiles)} sprite candidates as tiles")
-
-    # Get palette
-    palette_data = []
-    if palettes:
-        # Use the most interesting palette
-        palette_data = max(palettes, key=lambda p: sum(p[1]))[1]
-        print(f"  Using palette from @ ${max(palettes, key=lambda p: sum(p[1]))[0]:05X}")
+        for i, tile in enumerate(tiles[:512]):
+            for j in range(16):
+                if j < len(tile):
+                    chr_rom[i * 16 + j] = tile[j]
     else:
-        # Default NES palette
-        palette_data = [
-            0x0F, 0x30, 0x21, 0x12,  # BG 0-3
-            0x0F, 0x16, 0x27, 0x18,  # BG 4-7
-            0x0F, 0x0F, 0x0F, 0x0F,  # Sprite 0-3
-            0x0F, 0x0F, 0x0F, 0x0F,  # Sprite 4-7
-        ]
-        print("  Using default palette")
+        # Generate demo pattern: 512 tiles with checkerboard/box/diagonal/solid
+        for ti in range(512):
+            base = ti * 16
+            pattern = ti % 4
+            for y in range(8):
+                lo, hi = 0, 0
+                for x in range(8):
+                    v = 0
+                    if pattern == 0:      v = 1 if (x + y) % 2 == 0 else 0
+                    elif pattern == 1:    v = 1 if 1 < x < 6 and 1 < y < 6 else 0
+                    elif pattern == 2:    v = 1 if x == y or x == 7 - y else 0
+                    else:                 v = 1 if x < 4 else 0
+                    if v & 1: lo |= (1 << (7 - x))
+                    if v & 2: hi |= (1 << (7 - x))
+                chr_rom[base + y] = lo
+                chr_rom[base + y + 8] = hi
 
-    # Build ROM
-    print(f"Building NES ROM: {output_path}")
-    chr_rom = make_chr_rom(best_tiles)
-    prg_rom = make_6502_code(palette_data, len(chr_rom) > 0)
+    # ── Metadata marker (for --extract) ──
+    marker_ofs = -(6 + 3 + 2 + 4)
+    prg[marker_ofs:marker_ofs+3] = b'UF2'
+    prg[marker_ofs+3] = bs_len & 0xFF
+    prg[marker_ofs+4] = (bs_len >> 8) & 0xFF
+    struct.pack_into('<I', prg, marker_ofs+5, len(uf2_data))
 
-    has_chr = any(b != 0 for b in chr_rom)
-    chr_banks = 1 if has_chr else 0
-    if not has_chr:
-        # Still include CHR ROM even if empty
-        chr_banks = 1
-        chr_rom = make_chr_rom(None)
+    # ── iNES Header ──
+    h = bytearray(16)
+    h[0:4] = b'NES\x1a'
+    h[4] = prg_banks & 0xFF
+    h[5] = 1  # CHR: 1 x 8KB
+    h[6] = 1 | ((mapper & 0x0F) << 4)   # bit 0: vertical mirror, bits 4-7: mapper lower nibble
+    h[7] = (mapper >> 4) & 0x0F          # bits 0-3: mapper upper nibble
 
-    header = make_ines_header(prg_size=2, chr_size=chr_banks, mapper=0, mirroring=0)
+    return bytes(h), bytes(prg), bytes(chr_rom), mapper_name
 
-    with open(output_path, 'wb') as f:
+
+# ── Extract ──────────────────────────────────────────────────────────
+def extract_rom(path):
+    """Extract UF2 payload from a .nes file. Writes <name>.bin."""
+    with open(path, 'rb') as f:
+        d = f.read()
+    if d[:4] != b'NES\x1a':
+        print("Error: not a valid .nes file"); sys.exit(1)
+
+    prg_banks = d[4]
+    prg_size = prg_banks * 16384
+    prg = d[16:16+prg_size]
+
+    # Locate marker
+    marker = prg[-15:-12]
+    if marker != b'UF2':
+        print("Error: no UF2 metadata marker found in .nes")
+        print("  (This ROM was not created by this converter)")
+        sys.exit(1)
+
+    data_ofs = prg[-12] + 256 * prg[-11]
+    data_size = struct.unpack_from('<I', prg, -10)[0]
+
+    if data_ofs + data_size > prg_size:
+        print("Error: metadata out of range"); sys.exit(1)
+
+    raw = prg[data_ofs:data_ofs+data_size]
+    base = os.path.splitext(os.path.basename(path))[0]
+    out = f"{base}.bin"
+    with open(out, 'wb') as f:
+        f.write(raw)
+    print(f"Extracted {len(raw)} bytes -> {out}")
+
+
+# ── Entry ───────────────────────────────────────────────────────────
+def main():
+    if len(sys.argv) < 2:
+        print("UF2 → NES 1-to-1 Converter")
+        print(f"  python {os.path.basename(__file__)} <input.uf2> [output.nes]")
+        print(f"  python {os.path.basename(__file__)} <input.uf2> [output.nes] --scan")
+        print(f"  python {os.path.basename(__file__)} --extract <input.nes>")
+        sys.exit(0)
+
+    # Check for extract mode
+    if len(sys.argv) >= 3 and sys.argv[1] == '--extract':
+        extract_rom(sys.argv[2])
+        return
+
+    inp = sys.argv[1]
+    base = os.path.splitext(os.path.basename(inp))[0]
+    out = sys.argv[2] if len(sys.argv) > 2 and not sys.argv[2].startswith('--') else f"{base}.nes"
+    scan = '--scan' in sys.argv
+
+    if not os.path.exists(inp):
+        print(f"Error: file not found: {inp}"); sys.exit(1)
+
+    binary = parse_uf2(inp)
+
+    pals, tiles = scan_assets(binary)
+    if scan:
+        print(f"  Palette candidates: {len(pals)}")
+        for a, p in pals[:3]:
+            print(f"    @ ${a:05X}: [{' '.join(f'${b:02X}' for b in p[:8])}]")
+        print(f"  Tile candidates: {len(tiles)}")
+    else:
+        print(f"  Palettes: {len(pals)}, Tiles: {len(tiles)}")
+
+    header, prg, chr_rom, mapper_name = build_rom(binary, pals, tiles)
+
+    with open(out, 'wb') as f:
         f.write(header)
-        f.write(prg_rom)
+        f.write(prg)
         f.write(chr_rom)
 
-    size = os.path.getsize(output_path)
-    print(f"Done! {output_path} ({size} bytes)")
-    print(f"  PRG: 32KB, CHR: {chr_banks * 8}KB, Mapper: NROM")
-    print("  This ROM will boot on any NES emulator or flash cart.")
-
-    if not has_chr and not tiles:
-        print("\nNote: No sprite data found in UF2. The ROM contains demo")
-        print("graphics. For best results, use a UF2 with MakeCode Arcade games.")
-        print("Use --scan to see what was detected in the binary.")
-
+    size = os.path.getsize(out)
+    print(f"Written: {out} ({size} bytes)")
+    print(f"  Format: iNES ({mapper_name}, {len(prg)//1024}KB PRG + 8KB CHR)")
+    print(f"  UF2 payload: {len(binary)} bytes embedded 1:1 in PRG ROM")
+    print(f"  Use --extract <file.nes> to recover raw binary")
 
 if __name__ == '__main__':
     main()
