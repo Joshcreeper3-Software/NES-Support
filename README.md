@@ -1,71 +1,35 @@
-# NES Export for MakeCode Arcade
+# UF2 to NES ROM Converter
 
-Export your MakeCode Arcade games to NES ROM format (.nes) that runs in any NES emulator!
+Converts Raspberry Pi RP2040 UF2 firmware files into bootable .nes ROMs.
+Extracts graphics data from the UF2 binary and packages it with real 6502
+code into a valid iNES format ROM — runs on any NES emulator or flash cart.
 
 ## Usage
 
-### 1. Install the extension
-Add `pxt-nes-export` to your MakeCode Arcade project via Extensions.
-
-### 2. Add NES blocks to your game
-
-Use the blocks in the **NES Export** category:
-
-| Block | Description |
-|-------|-------------|
-| `set NES palette to [type]` | Choose color palette (Original, Vivid, Pico-8, Game Boy) |
-| `set palette index [i] to color [c]` | Customize individual palette colors |
-| `set NES mapper to [mapper]` | Select mapper (NROM, MMC1, UNROM, CNROM) |
-| `set mirroring to [mode]` | Set nametable mirroring |
-| `set tile at (x,y) to [index]` | Place tiles in the nametable |
-| `convert [img] to CHR data` | Convert a sprite to NES pattern table format |
-| `add sprite [img] to CHR ROM as tile [n]` | Add sprite to ROM at specific tile index |
-| `export NES ROM data` | Generate the ROM data as JSON |
-| `log NES ROM info` | Print ROM details to console |
-| `clear NES data` | Reset all NES export data |
-
-### 3. Generate the ROM
-
-In your game, call `export NES ROM data` and copy the JSON output.
-
-### 4. Convert to .nes
-
 ```bash
-python nes_rom.py export.json mygame.nes
+python uf2nes.py game.uf2 game.nes
+python uf2nes.py game.uf2 game.nes --scan   # show what's detected
 ```
 
-## Example
+## How it works
 
-```typescript
-// Set up NES export
-nes.setPalette(NesPalette.Original)
-nes.setMapper(NesMapper.NROM)
-nes.setMirroring(NesMirroring.Horizontal)
+1. **Parses UF2** — extracts 256-byte data blocks, reconstructs the binary
+2. **Scans for assets** — finds palette data and sprite/tile patterns
+3. **Generates 6502 code** — NES init, PPU setup, palette load, sprite DMA
+4. **Wraps in iNES** — standard .nes file with header, PRG, and CHR ROM
 
-// Add sprites
-let player = sprites.create(img`...`, SpriteKind.Player)
-nes.addSprite(player.image, 0)
+The result is a fully bootable NES ROM that displays the extracted graphics.
 
-// Export
-let romData = nes.exportData()
-nes.logInfo()
-```
+## Requirements
 
-## Converter Tool
+- Python 3.6+
 
-`nes_rom.py` converts the JSON export to a .nes ROM file.
+## Notes
 
-Requires Python 3. No additional dependencies.
-
-## Supported Mappers
-
-- **NROM (Mapper 0)** - 16-32KB PRG, 8KB CHR
-- **MMC1 (Mapper 1)** - Up to 256KB PRG, 128KB CHR
-- **UNROM (Mapper 2)** - 128-256KB PRG, 8KB CHR
-- **CNROM (Mapper 3)** - 16-32KB PRG, 32KB CHR
+- Best results with UF2 files from **MakeCode Arcade** RP2040 builds
+- The ROM boots on any NES emulator (FCEUX, Mesen, Nestopia) or flash cart
+- Mapper: NROM (Mapper 0), Mirroring: Horizontal
 
 ## License
 
 MIT
-
-for PXT/arcade

@@ -1,3 +1,4 @@
-*.js
-*.d.ts
-node_modules
+*.pyc
+__pycache__/
+*.nes
+*.uf2
