@@ -92,12 +92,12 @@ def build_rom(uf2_data, pals, tiles):
     The raw UF2 payload is embedded 1:1 in PRG ROM after the bootstrap.
     """
     # ── Bootstrap 6502 code (placed at $8000) ──
-    # We use a stack of bytearrays to avoid forward-reference fixups.
-    # Build the wait-vblank subroutine first, compute its CPU address,
-    # then emit the JSRs with the correct address from the start.
+    #
+    # Determine mapper up front so we can conditionally include MMC1 init.
+    approx_min_banks = (len(uf2_data) + 768) // 16384  # 768 = generous bootstrap estimate
+    use_mmc1 = approx_min_banks > 2
 
-    # wait-vblank subroutine (BIT $2002 ; BPL -3 ; RTS)
-    sub_wait = [0x2C, 0x02, 0x20, 0x10, 0xFB, 0x60]
+    sub_wait = [0x2C, 0x02, 0x20, 0x10, 0xFB, 0x60]  # BIT $2002 ; BPL -3 ; RTS
 
     bootstrap = []
     def emit(*args):
@@ -112,48 +112,51 @@ def build_rom(uf2_data, pals, tiles):
         0xD8,                         # CLD
         0xA2, 0xFF, 0x9A,             # LDX #$FF ; TXS
         0xA2, 0x00,                   # LDX #$00
-        0x8E, 0x00, 0x20,             # STX $2000
-        0x8E, 0x01, 0x20,             # STX $2001
+        0x8E, 0x00, 0x20,             # STX $2000   ; PPU CTRL = 0
+        0x8E, 0x01, 0x20,             # STX $2001   ; PPU MASK = 0
     )
 
-    # Wait 2 vblanks — we know sub_wait will be placed right after enable-code
-    # For now emit placeholder addresses, will patch later
-    jsr_wait_idx1 = len(bootstrap)
-    emit(0x20, 0x00, 0x00)  # placeholder JSR
-    jsr_wait_idx2 = len(bootstrap)
-    emit(0x20, 0x00, 0x00)  # placeholder JSR
+    # MMC1 init (harmless on NROM: writes to ROM are no-ops)
+    if use_mmc1:
+        emit(0xA9, 0x80, 0x8D, 0x00, 0x80)  # LDA #$80; STA $8000 — reset MMC1 shift register
 
-    # Load palette
+    # Wait 2 vblanks — placeholder JSRs patched later
+    jsr_wait_idx1 = len(bootstrap)
+    emit(0x20, 0x00, 0x00)
+    jsr_wait_idx2 = len(bootstrap)
+    emit(0x20, 0x00, 0x00)
+
+    # Build palette: start with a visible fallback, overlay scanned data
+    fallback_pal = [0x0F, 0x16, 0x30, 0x16] * 8  # black, blue, white, blue repeat
+    pal_data = fallback_pal[:32]
+    if pals:
+        scanned = max(pals, key=lambda p: sum(p[1]))[1]
+        for i in range(min(32, len(scanned))):
+            if scanned[i] != 0x00:  # skip zero bytes in scanned, keep fallback
+                pal_data[i] = scanned[i] & 0x3F
+
+    # Load palette address $3F00
     emit(0xA9, 0x3F, 0x8D, 0x06, 0x20)  # STA $2006 ; high
     emit(0xA9, 0x00, 0x8D, 0x06, 0x20)  # STA $2006 ; low
-
-    pal_data = []
-    if pals:
-        pal_data = max(pals, key=lambda p: sum(p[1]))[1]
-    while len(pal_data) < 32:
-        pal_data.append(0x0F)
-    pal_data = [b & 0x3F for b in pal_data[:32]]
     for pb in pal_data:
-        emit(0xA9, pb, 0x8D, 0x07, 0x20)
+        emit(0xA9, pb, 0x8D, 0x07, 0x20)  # LDA #pb ; STA $2007
 
-    # Enable rendering
-    emit(
-        0xA9, 0x90, 0x8D, 0x00, 0x20,  # LDA #$90 ; STA $2000
-        0xA9, 0x1E, 0x8D, 0x01, 0x20,  # LDA #$1E ; STA $2001
-        0xA9, 0x00, 0x8D, 0x03, 0x20,  # STA $2003
-        0xA9, 0x02, 0x8D, 0x03, 0x20,  # STA $2003
-    )
-
-    # Now sub_wait goes here — compute its CPU address
+    # Now sub_wait goes here — compute its CPU address and patch JSRs
     sub_wait_addr = 0x8000 + len(bootstrap)
-    # Patch the two JSRs
     bootstrap[jsr_wait_idx1 + 1] = sub_wait_addr & 0xFF
     bootstrap[jsr_wait_idx1 + 2] = (sub_wait_addr >> 8) & 0xFF
     bootstrap[jsr_wait_idx2 + 1] = sub_wait_addr & 0xFF
     bootstrap[jsr_wait_idx2 + 2] = (sub_wait_addr >> 8) & 0xFF
     emit(sub_wait)
 
-    # Build OAM data: 16 sprites in a grid
+    # Enable rendering + OAM
+    emit(
+        0xA9, 0x90, 0x8D, 0x00, 0x20,  # LDA #$90 ; STA $2000  (NMI on, sprites $0000, bg $1000)
+        0xA9, 0x1E, 0x8D, 0x01, 0x20,  # LDA #$1E ; STA $2001  (show all)
+        0xA9, 0x00, 0x8D, 0x03, 0x20,  # STA $2003              (OAM addr low = 0)
+    )
+
+    # 16 sprites in a 4x4 grid
     oam = []
     for row in range(4):
         for col in range(4):
@@ -162,16 +165,15 @@ def build_rom(uf2_data, pals, tiles):
             ti = row * 4 + col
             oam += [sy & 0xFF, ti, 0x00, sx & 0xFF]
 
-    # Copy OAM to $0200 via inline LDA/STA (no loop)
     for b in oam:
-        emit(0xA9, b, 0x9D, 0x00, 0x02, 0xE8)  # LDA #b; STA $0200,X; INX
+        emit(0xA9, b, 0x9D, 0x00, 0x02, 0xE8)  # LDA #b ; STA $0200,X ; INX
 
-    # Fire OAM DMA
-    emit(0xA9, 0x02, 0x8D, 0x14, 0x40)  # LDA #2; STA $4014
+    emit(0xA9, 0x02, 0x8D, 0x14, 0x40)  # LDA #2 ; STA $4014  (OAM DMA)
 
-    # Main loop (infinite)
+    # Infinite main loop (JMP to CPU address $8000 + offset)
     main_loop_ofs = len(bootstrap)
-    emit(0x4C, main_loop_ofs & 0xFF, (main_loop_ofs >> 8) & 0xFF)
+    main_cpu = 0x8000 + main_loop_ofs
+    emit(0x4C, main_cpu & 0xFF, (main_cpu >> 8) & 0xFF)  # JMP $8000+main_loop_ofs
 
     bs_len = len(bootstrap)
 
