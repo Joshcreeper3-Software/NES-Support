@@ -1,0 +1,14 @@
+{
+    "name": "NES Export",
+    "version": "0.0.1",
+    "description": "Export your MakeCode Arcade games to NES ROM format",
+    "license": "MIT",
+    "dependencies": {
+        "device": "*"
+    },
+    "files": [
+        "main.ts"
+    ],
+    "supportedTargets": ["arcade"],
+    "preferredEditor": "ts"
+}

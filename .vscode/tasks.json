@@ -1,0 +1,12 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "pxt build",
+            "type": "shell",
+            "command": "pxt build",
+            "group": "build",
+            "problemMatcher": []
+        }
+    ]
+}
